@@ -1,0 +1,58 @@
+[project]
+name = "language-model-from-scratch"
+version = "0.1.0"
+description = "Este projeto é destinado à implementação do zero de um Modelo de Linguagem do tipo Decoder-Only baseado na arquitetura de Transformer"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "einops>=0.8.2",
+    "jaxtyping>=0.3.10",
+    "numpy>=2.4.4",
+    "torch>=2.11.0",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+    "mypy>=2.1.0",
+    "ruff>=0.15.12",
+    "taskipy>=1.14.1",
+    "typos>=1.46.1",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src"]
+
+[tool.ruff]
+line-length = 130
+
+[tool.ruff.lint]
+select = [
+    "E",  
+    "W",  
+    "F",  
+    "I",  
+    "B",  
+    "C4",
+    "UP",  
+]
+ignore = [
+    "E501",  
+    "B008",  
+    "C901",  
+    "W191",  
+]
+
+[tool.mypy]
+strict = true
+ignore_missing_imports = true
+
+[tool.taskipy.tasks]
+format = "ruff format ." # Formata o código automaticamente com o Ruff
+lint = "ruff check ." # Verifica erros de código e más práticas com o Ruff
+typecheck = "mypy ." # Checa a tipagem estática com o Mypy
+check = "task format && task lint && task typecheck" # Roda toda a bateria de testes de qualidade de uma vez
