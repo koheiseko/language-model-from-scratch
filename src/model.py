@@ -4,6 +4,7 @@ import einops
 import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
+from functional import softmax
 
 
 class Linear(nn.Module):
@@ -48,7 +49,7 @@ class Linear(nn.Module):
             x:
         """
 
-        return einops.einsum(x, self.weights.T, "... in_features -> ... out_features")
+        return einops.einsum(x, self.weights.T, "... in_features, in_features out_features -> ... out_features")
 
 
 class Embedding(nn.Module):
@@ -164,7 +165,7 @@ class SwiGLU(nn.Module):
         self.w2 = Linear(dim, hidden_dim, device=device, dtype=dtype)
         self.w3 = Linear(hidden_dim, dim, device=device, dtype=dtype)
 
-    def forward(self, x: Float[torch.Tensor, "... d_model"]) -> Float[torch.Tensor, "... d_model"]:
+    def forward(self, x: Float[torch.Tensor, "... dim"]) -> Float[torch.Tensor, "... dim"]:
         """
 
 
@@ -244,3 +245,130 @@ class RotaryPositionalEmbedding(nn.Module):
         x = x * cos[token_positions, :] + x_rh * sin[token_positions, :]
 
         return x
+
+
+def scaled_dot_product_attention(
+    query: Float[torch.Tensor, "... seq_len d_k"],
+    key: Float[torch.Tensor, "... seq_len d_k"],
+    value: Float[torch.Tensor, "... seq_len d_v"],
+    is_causal: bool | None,
+):
+    """
+    Aplica o Scaled Dot Product Attention (SDPA).
+
+    Args:
+        query:
+        key:
+        value:
+        is_causal:
+    """
+    device, dtype = query.device, query.dtype
+
+    L, S = query.size(-2), key.size(-2)
+    scale_factor = 1 / math.sqrt(key.size(-1))
+
+    attn_bias = torch.zeros(L, S, dtype=dtype, device=device)
+    if is_causal:
+        temp_mask = torch.ones(L, S, dtype=bool, device=device).tril(diagonal=0)
+        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+
+    attn = einops.einsum(
+        query,
+        key,
+        "... seq_len_q d_k, ... seq_len_k d_k -> ... seq_len_q seq_len_k",
+    )  # query @ key.T
+
+    attn *= scale_factor
+    attn += attn_bias
+    attn = softmax(attn, dim=-1)
+    attn = einops.einsum(attn, value, "... seq_len_q seq_len_k, ... seq_len_k d_v -> ... seq_len_q d_v")
+
+    return attn
+
+
+class MultiHeadAttention(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        max_seq_len: int,
+        is_causal: bool,
+        theta: float,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        """
+        Inicializa o Multi Head Attention (MHA).
+
+        Args:
+            Args:
+            d_model:
+            num_heads:
+            max_seq_len:
+            theta:
+            device:
+            dtype:
+
+        Atributos:
+            head_dim:
+            rope:
+            w_q:
+            w_k:
+            w_v:
+            w_o:
+        """
+        super().__init__()
+
+        self.head_dim = d_model // num_heads
+        self.is_causal = is_causal
+
+        self.rope = RotaryPositionalEmbedding(
+            theta=theta,
+            dim=self.head_dim,
+            max_seq_len=max_seq_len,
+            device=device,
+        )
+
+        self.w_q = Linear(d_model, self.head_dim * num_heads, device=device, dtype=dtype)
+        self.w_k = Linear(d_model, self.head_dim * num_heads, device=device, dtype=dtype)
+        self.w_v = Linear(d_model, self.head_dim * num_heads, device=device, dtype=dtype)
+        self.w_o = Linear(self.head_dim * num_heads, d_model, device=device, dtype=dtype)
+
+    def forward(
+        self,
+        x: Float[torch.Tensor, "... seq_len d_model"],
+        token_positions: Int[torch.Tensor, "... seq_len"],
+    ) -> Float[torch.Tensor, "... seq_len d_model"]:
+        """
+
+
+        Args:
+            x:
+            token_positions:
+        """
+        query = einops.rearrange(
+            self.w_q(x),
+            "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim",
+            head_dim=self.head_dim,
+        ).contiguous()
+        key = einops.rearrange(
+            self.w_k(x),
+            "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim",
+            head_dim=self.head_dim,
+        ).contiguous()
+        value = einops.rearrange(
+            self.w_v(x),
+            "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim",
+            head_dim=self.head_dim,
+        ).contiguous()
+
+        query = self.rope(query, token_positions)
+        key = self.rope(key, token_positions)
+        output = scaled_dot_product_attention(query, key, value, is_causal=self.is_causal)
+        output = einops.rearrange(
+            output,
+            "... num_heads seq_len head_dim -> ... seq_len (num_heads head_dim)",
+        )
+        output = self.w_o(output)
+
+        return output
