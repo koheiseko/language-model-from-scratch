@@ -372,3 +372,151 @@ class MultiHeadAttention(nn.Module):
         output = self.w_o(output)
 
         return output
+
+
+class TransformerBlock(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        num_heads: int,
+        max_seq_len: int,
+        theta: float,
+        eps: float,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        """
+        Inicializa o bloco do Transformer.
+
+        Args:
+            d_model:
+            d_ff:
+            num_heads:
+            max_seq_len:
+            theta:
+            eps:
+            device:
+            dtype:
+
+        Atributos:
+            ffn:
+            mha:
+            attn_norm:
+            ffn_norm
+        """
+        super().__init__()
+
+        self.mha = MultiHeadAttention(
+            d_model=d_model,
+            num_heads=num_heads,
+            max_seq_len=max_seq_len,
+            theta=theta,
+            device=device,
+            dtype=dtype,
+        )
+        self.ffn = SwiGLU(dim=d_model, hidden_dim=d_ff, device=device, dtype=dtype)
+        self.attn_norm = RMSNorm(dim=d_model, eps=eps, device=device, dtype=dtype)
+        self.ffn_norm = RMSNorm(dim=d_model, eps=eps, device=device, dtype=dtype)
+
+    def forward(
+        self,
+        x: Float[torch.Tensor, "... seq_len d_model"],
+        token_positions: Int[torch.Tensor, "... seq_len"],
+    ) -> Float[torch.Tensor, "... seq_len d_model"]:
+        """
+
+
+        Args:
+            x:
+            token_positions:
+        """
+        x = x + self.mha(self.attn_norm(x), token_positions)
+        x = x + self.ffn(self.ffn_norm(x))
+
+        return x
+
+
+class Transformer(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        num_layers: int,
+        num_heads: int,
+        vocab_size: int,
+        context_length: int,
+        theta: float,
+        eps: float,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        """
+        Inicializa o modelo de Transformer.
+
+        Args:
+            d_model:
+            d_ff:
+            num_heads:
+            max_seq_len:
+            theta:
+            eps:
+            device:
+            dtype:
+
+        Atributos:
+            tok_embeddings:
+            transformer_blocks:
+            norm:
+            output:
+        """
+        super().__init__()
+
+        self.tok_embeddings = Embedding(
+            num_embeddings=vocab_size,
+            embeddings_dim=d_model,
+            device=device,
+            dtype=dtype,
+        )
+
+        self.tranformer_blocks = nn.ModuleList(
+            [
+                TransformerBlock(
+                    d_model=d_model,
+                    d_ff=d_ff,
+                    num_heads=num_heads,
+                    max_seq_len=context_length,
+                    theta=theta,
+                    eps=eps,
+                    device=device,
+                    dtype=dtype,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+
+        self.norm = RMSNorm(dim=d_model, eps=eps, device=device, dtype=dtype)
+        self.output = Linear(d_model, d_model)
+
+    @torch.inference_mode()
+    def forward(
+        self,
+        x: Float[torch.Tensor, "... seq_len d_model"],
+        token_positions: Int[torch.Tensor, "... seq_len"],
+    ) -> Float[torch.Tensor, "... seq_len d_model"]:
+        """
+
+
+        Args:
+            x:
+            token_positions:
+        """
+        h = self.tok_embeddings(x)
+
+        for transformer_block in self.tranformer_blocks:
+            h = transformer_block(h, token_positions)
+
+        h = self.norm(h)
+        output = self.output(h).float()
+
+        return output
