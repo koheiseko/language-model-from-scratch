@@ -1,7 +1,8 @@
 import torch
 from jaxtyping import Float, Int
-from src.functional import softmax
-from src.model import Transformer
+
+from languagemodel.functional import softmax
+from languagemodel.model import Transformer
 
 
 def sample(

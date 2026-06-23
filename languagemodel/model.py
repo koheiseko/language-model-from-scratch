@@ -4,7 +4,8 @@ import einops
 import torch
 import torch.nn as nn
 from jaxtyping import Float, Int
-from src.functional import softmax
+
+from languagemodel.functional import softmax
 
 
 class Linear(nn.Module):
