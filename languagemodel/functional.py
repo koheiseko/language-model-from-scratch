@@ -6,11 +6,13 @@ def softmax(
     input: Float[torch.Tensor, "..."], dim: int
 ) -> Float[torch.Tensor, "..."]:
     """
-    Aplica a função softmax.
+    Dado um tensor como input, retorna como output um tensor com a função softmax aplicado nos valores de acordo com a dimensão.
 
     Args:
-        input:
-        dim:
+        input (Float[torch.Tensor, "..."]): Tensor para a aplicação da função softmax. O shape é arbitrário.
+        dim (int): Dimensão que deve ser aplicado a função softmax.
+    Returns:
+        Float[torch.Tensor, "..."]: Tensor com o mesmo shape do "input" normalizado através da função softmax de acordo com o valor de "dim".
     """
     c = input.max(dim=dim, keepdim=True).values
     input_stable = input - c
@@ -19,37 +21,29 @@ def softmax(
     return input_exp / input_exp.sum(dim=dim, keepdim=True)
 
 
-def cross_entropy_loss(
-    logits: Float[torch.Tensor, "... seq_len vocab_size"],
-    target: Int[torch.Tensor, "... seq_len"],
-):
+def cross_entropy(
+    inputs: Float[torch.Tensor, "... sequence_length vocab_size"],
+    targets: Int[torch.Tensor, "... sequence_length"],
+) -> Float[torch.Tensor, ""]:
     """
-    Calcula a Cross Entropy Loss
+    Dado um tensor como inputs e outro como targets, computa a média da cross entropy loss dos exemplos.
 
     Args:
-        logits:
-        target:
+        inputs (inputs: Float[torch.Tensor, "... sequence_length vocab_size"]): inputs[i][j] é o logit não normalizado da classe jth para o exemplo ith.
+        targets (Int[torch.Tensor, "... sequence_length"]): Tensor contendo o index da classe correta para cada exemplo.
+    Returns:
+        Float[torch.Tensor, ""]: Média da cross entropy loss dos exemplos.
     """
 
-    max_logits, _ = logits.max(dim=-1, keepdim=True)
-    logits = logits - max_logits
+    max_inputs, _ = inputs.max(dim=-1, keepdim=True)
+    inputs = inputs - max_inputs
 
-    probs = (
-        -torch.gather(logits, index=target.unsqueeze(-1), dim=-1)
-        + logits.exp().sum(dim=-1, keepdim=True).log()
-    )
+    log_sum_exp = (
+        inputs.exp().sum(dim=-1, keepdim=True).log()
+    )  # (... sequence_length)
 
-    loss = probs.mean()
+    target_logit = torch.gather(inputs, index=targets.unsqueeze(-1), dim=-1)
 
-    return loss
+    losses = log_sum_exp - target_logit  # (... sequence_length)
 
-
-def perplexity(losses: Float[torch.Tensor, "..."]) -> torch.FloatType:
-    """
-    Calcula a Perplexidade
-
-    Args:
-        losses:
-    """
-
-    return losses.mean().exp()
+    return losses.mean()

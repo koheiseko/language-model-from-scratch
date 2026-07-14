@@ -3,10 +3,11 @@ import math
 import einops
 import torch
 import torch.nn as nn
-from jaxtyping import Float, Int
+from jaxtyping import Bool, Float, Int
 
 from languagemodel.functional import softmax
 
+# Tornar o RoPE injetável, pois um único objeto  pode ser usado em todas as leyers, tornado desnecessário o instanciamento dela em cada layer.
 
 class Linear(nn.Module):
     def __init__(
@@ -18,6 +19,8 @@ class Linear(nn.Module):
     ):
         """
         Inicializa o módulo Linear
+
+        Sem bias, seguindo a prática comum em LLMs.
 
         Args:
             in_features:
@@ -43,7 +46,7 @@ class Linear(nn.Module):
         )
         nn.init.trunc_normal_(tensor, mean=0.0, std=std, a=-3 * std, b=3 * std)
 
-        self.weights = nn.Parameter(tensor)
+        self.weights = nn.Parameter(tensor, requires_grad=True)
 
     def forward(
         self, x: Float[torch.Tensor, "... in_features"]
@@ -57,16 +60,19 @@ class Linear(nn.Module):
 
         return einops.einsum(
             x,
-            self.weights.T,
-            "... in_features, in_features out_features -> ... out_features",
+            self.weights,
+            "... in_features, out_features in_features-> ... out_features",
         )
+
+    def extra_repr(self):
+        return f"in_features={self.weight.shape[1]}, out_features={self.weight.shape[0]}"
 
 
 class Embedding(nn.Module):
     def __init__(
         self,
         num_embeddings: int,
-        embeddings_dim: int,
+        embedding_dim: int,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
@@ -74,30 +80,27 @@ class Embedding(nn.Module):
         Inicializa o Módulo de Embedding.
 
         Args:
-            num_embeddings:
-            embeddings_dim:
+            num_embeddings: Número de embeddings de acordo com o tamanho do vocabulário.
+            embedding_dim: Tamanho da dimensão de cada embedding.
             device:
             dtype:
 
         Atributos:
             num_embeddings:
-            embeddings_dim:
+            embedding_dim:
             weight:
         """
         super().__init__()
-        self.num_embeddings = num_embeddings
-        self.embeddings_dim = embeddings_dim
-
         tensor = torch.empty(
-            num_embeddings, embeddings_dim, device=device, dtype=dtype
+            num_embeddings, embedding_dim, device=device, dtype=dtype
         )
         nn.init.trunc_normal_(tensor, mean=0.0, std=1.0, a=-3, b=3)
 
-        self.weight = nn.Parameter(tensor)
+        self.weights = nn.Parameter(tensor, requires_grad=True)
 
     def forward(
-        self, token_ids: Int[torch.LongTensor, "... seq_len"]
-    ) -> Float[torch.Tensor, "... seq_len embeddings_dim"]:
+        self, token_ids: Int[torch.LongTensor, "..."]
+    ) -> Float[torch.Tensor, "... embedding_dim"]:
         """
 
 
@@ -105,7 +108,10 @@ class Embedding(nn.Module):
             token_ids:
         """
 
-        return self.weight[token_ids]
+        return self.weights[token_ids, :]
+
+    def extra_repr(self):
+        return f"vocab_size={self.weight.shape[0]}, embedding_dim={self.weight.shape[1]}"
 
 
 class RMSNorm(nn.Module):
@@ -131,7 +137,9 @@ class RMSNorm(nn.Module):
             eps:
         """
         super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim, device=device, dtype=dtype))
+        self.weights = nn.Parameter(
+            torch.ones(dim, device=device, dtype=dtype), requires_grad=True
+        )
         self.eps = eps
 
     def forward(
@@ -144,12 +152,15 @@ class RMSNorm(nn.Module):
             x:
         """
         in_dtype = x.dtype
-        x = x.to(torch.float32)
 
+        x = x.to(torch.float32)
         rms = x.pow(2).mean(dim=-1, keepdim=True).add(self.eps).sqrt()
-        result = (x / rms) * self.weight
+        result = (x / rms) * self.weights
 
         return result.to(in_dtype)
+
+    def extra_repr(self):
+        return f"hidden_size={self.weights.shape[0]}, eps={self.eps}"
 
 
 class SwiGLU(nn.Module):
@@ -177,9 +188,9 @@ class SwiGLU(nn.Module):
         """
         super().__init__()
 
-        self.w1 = Linear(dim, hidden_dim, device=device, dtype=dtype)
-        self.w2 = Linear(dim, hidden_dim, device=device, dtype=dtype)
-        self.w3 = Linear(hidden_dim, dim, device=device, dtype=dtype)
+        self.w1_weight = Linear(dim, hidden_dim, device=device, dtype=dtype)
+        self.w2_weight = Linear(hidden_dim, dim, device=device, dtype=dtype)
+        self.w3_weight = Linear(dim, hidden_dim, device=device, dtype=dtype)
 
     def forward(
         self, x: Float[torch.Tensor, "... dim"]
@@ -190,12 +201,12 @@ class SwiGLU(nn.Module):
         Args:
             x:
         """
-        x1 = self.w1(x)
+        x1 = self.w1_weight(x)
         values = x1 * torch.sigmoid(x1)
 
-        gates = self.w2(x)
+        gates = self.w3_weight(x)
 
-        return self.w3(values * gates)
+        return self.w2_weight(values * gates)
 
 
 class RotaryPositionalEmbedding(nn.Module):
@@ -241,9 +252,9 @@ class RotaryPositionalEmbedding(nn.Module):
 
     def forward(
         self,
-        x: Float[torch.Tensor, "... seq_len dim"],
-        token_positions: Int[torch.Tensor, "... seq_len"],
-    ) -> Float[torch.Tensor, "... seq_len dim"]:
+        x: Float[torch.Tensor, "... sequence_length dim"],
+        token_positions: Int[torch.Tensor, "... sequence_length"],
+    ) -> Float[torch.Tensor, "... sequence_length dim"]:
         """
 
 
@@ -254,7 +265,7 @@ class RotaryPositionalEmbedding(nn.Module):
         x1, x2 = x[..., 0::2], x[..., 1::2]
         x_rh = einops.rearrange(
             torch.stack([-x2, x1], dim=-1),
-            "... seq_len half_dim pair -> ... seq_len (half_dim pair)",
+            "... sequence_length half_dim pair -> ... sequence_length (half_dim pair)",
         )
 
         cos = self.cos.to(x.dtype)
@@ -266,48 +277,66 @@ class RotaryPositionalEmbedding(nn.Module):
 
         return x
 
+    def extra_repr(self):
+        return f"context_length={self._freq_cis_cache.shape[0]}, dim/2={self._freq_cis_cache.shape[1]}"
 
 def scaled_dot_product_attention(
-    query: Float[torch.Tensor, "... seq_len d_k"],
-    key: Float[torch.Tensor, "... seq_len d_k"],
-    value: Float[torch.Tensor, "... seq_len d_v"],
-    is_causal: bool | None,
-):
+    query: Float[torch.Tensor, "... queries d_k"],
+    key: Float[torch.Tensor, "  ... keys    d_k"],
+    value: Float[torch.Tensor, "... keys    d_v"],
+    is_causal: bool,
+    attn_mask: Bool[torch.Tensor, " ... queries keys"] | None = None,
+) -> Float[torch.Tensor, "... queries d_v"]:
     """
-    Aplica o Scaled Dot Product Attention (SDPA).
+    Esta função implementa o Scaled Dot Product Attention (SDPA).
 
     Args:
-        query:
-        key:
-        value:
+        query: Tensor de queries, pode ter qualquer número de dimensões iniciais. 
+        key: Tensor de keys, compartilha o número de dimensões iniciais com "query".
+        value: Tensor de values, 
         is_causal:
+        attn_mask: 
+
+    Returns:
     """
     device, dtype = query.device, query.dtype
 
-    L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(key.size(-1))
+    queries, keys = query.size(-2), key.size(-2)
+    d_k = key.size(-1)
+    scale_factor = 1 / math.sqrt(d_k)
 
-    attn_bias = torch.zeros(L, S, dtype=dtype, device=device)
+    attn_bias = torch.zeros((queries, keys), dtype=dtype, device=device)
+
     if is_causal:
-        temp_mask = torch.ones(L, S, dtype=bool, device=device).tril(diagonal=0)
-        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+        assert attn_mask is None, "attn_mask não pode ser passado junto com is_causal=True"
 
-    attn = einops.einsum(
-        query,
-        einops.rearrange(key, "... seq_len d_k -> ... d_k seq_len"),
-        "... seq_len_q d_k, ... d_k seq_len_k -> ... seq_len_q seq_len_k",
-    )  # query @ key.T
+        temp_mask = torch.ones_like(attn_bias, dtype=torch.bool).triu_(
+            diagonal=1
+        )
+        attn_bias.masked_fill_(temp_mask, float("-inf"))
 
-    attn *= scale_factor
-    attn += attn_bias
-    attn = softmax(attn, dim=-1)
-    attn = einops.einsum(
-        attn,
-        value,
-        "... seq_len_q seq_len_k, ... seq_len_k d_k -> ... seq_len_q d_k",
+    if attn_mask is not None:
+        if attn_mask.dtype == torch.bool:
+            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_bias = attn_bias + attn_mask
+
+    attn_scores = (
+        einops.einsum(
+            query,
+            key,
+            "... queries d_k, ... keys d_k -> ... queries keys",
+        )
+        * scale_factor
     )
+    attn_scores += attn_bias
+    attn_weights = softmax(attn_scores, dim=-1)
 
-    return attn
+    return einops.einsum(
+        attn_weights,
+        value,
+        "... queries keys, ... keys d_v -> ... queries d_v",
+    )
 
 
 class MultiHeadAttention(nn.Module):
@@ -317,6 +346,7 @@ class MultiHeadAttention(nn.Module):
         num_heads: int,
         max_seq_len: int,
         theta: float,
+        eps: float,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
@@ -333,16 +363,19 @@ class MultiHeadAttention(nn.Module):
             dtype:
 
         Atributos:
-            head_dim:
+            num_heads:
             rope:
-            w_q:
-            w_k:
-            w_v:
-            w_o:
+            q_proj:
+            k_proj:
+            v_proj:
+            o_proj:
         """
         super().__init__()
 
+        assert d_model % num_heads == 0, 'O valor de "d_model" deve ser divisível pelo valor de "num_heads."'
+
         self.head_dim = d_model // num_heads
+        self.num_heads = num_heads
 
         self.rope = RotaryPositionalEmbedding(
             theta=theta,
@@ -351,24 +384,33 @@ class MultiHeadAttention(nn.Module):
             device=device,
         )
 
-        self.w_q = Linear(
+        # QK-Norm
+        self.q_norm = RMSNorm(
+            dim=self.head_dim, eps=eps, device=device, dtype=dtype
+        )
+        self.k_norm = RMSNorm(
+            dim=self.head_dim, eps=eps, device=device, dtype=dtype
+        )
+
+        self.q_proj = Linear(
             d_model, self.head_dim * num_heads, device=device, dtype=dtype
         )
-        self.w_k = Linear(
+        self.k_proj = Linear(
             d_model, self.head_dim * num_heads, device=device, dtype=dtype
         )
-        self.w_v = Linear(
+        self.v_proj = Linear(
             d_model, self.head_dim * num_heads, device=device, dtype=dtype
         )
-        self.w_o = Linear(
+        self.o_proj = Linear(
             self.head_dim * num_heads, d_model, device=device, dtype=dtype
         )
 
     def forward(
         self,
-        x: Float[torch.Tensor, "... seq_len d_model"],
-        token_positions: Int[torch.Tensor, "... seq_len"],
-    ) -> Float[torch.Tensor, "... seq_len d_model"]:
+        x: Float[torch.Tensor, "... sequence_length d_model"],
+        token_positions: Int[torch.Tensor, "... sequence_length"],
+        is_causal: bool = True,
+    ) -> Float[torch.Tensor, "... sequence_length d_model"]:
         """
 
 
@@ -377,30 +419,35 @@ class MultiHeadAttention(nn.Module):
             token_positions:
         """
         query = einops.rearrange(
-            self.w_q(x),
-            "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim",
-            head_dim=self.head_dim,
+            self.q_proj(x),
+            "... sequence_length (num_heads head_dim) -> ... num_heads sequence_length head_dim",
+            num_heads=self.num_heads,
         ).contiguous()
         key = einops.rearrange(
-            self.w_k(x),
-            "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim",
-            head_dim=self.head_dim,
+            self.k_proj(x),
+            "... sequence_length (num_heads head_dim) -> ... num_heads sequence_length head_dim",
+            num_heads=self.num_heads,
         ).contiguous()
         value = einops.rearrange(
-            self.w_v(x),
-            "... seq_len (num_heads head_dim) -> ... num_heads seq_len head_dim",
-            head_dim=self.head_dim,
+            self.v_proj(x),
+            "... sequence_length (num_heads head_dim) -> ... num_heads sequence_length head_dim",
+            num_heads=self.num_heads,
         ).contiguous()
+
+        query = self.q_norm(query)
+        key = self.k_norm(key)
 
         query = self.rope(query, token_positions)
         key = self.rope(key, token_positions)
 
-        output = scaled_dot_product_attention(query, key, value, is_causal=True)
-        output = einops.rearrange(
-            output,
-            "... num_heads seq_len head_dim -> ... seq_len (num_heads head_dim)",
+        attn = scaled_dot_product_attention(
+            query, key, value, is_causal=is_causal
         )
-        output = self.w_o(output)
+        attn = einops.rearrange(
+            attn,
+            "... num_heads sequence_length head_dim -> ... sequence_length (num_heads head_dim)",
+        )
+        output = self.o_proj(attn)
 
         return output
 
@@ -449,6 +496,7 @@ class TransformerBlock(nn.Module):
             num_heads=num_heads,
             max_seq_len=max_seq_len,
             theta=theta,
+            eps=eps,
             device=device,
             dtype=dtype,
         )
@@ -517,12 +565,12 @@ class Transformer(nn.Module):
 
         self.tok_embeddings = Embedding(
             num_embeddings=vocab_size,
-            embeddings_dim=d_model,
+            embedding_dim=d_model,
             device=device,
             dtype=dtype,
         )
 
-        self.tranformer_blocks = nn.ModuleList(
+        self.transformer_blocks = nn.ModuleList(
             [
                 TransformerBlock(
                     d_model=d_model,
@@ -544,11 +592,15 @@ class Transformer(nn.Module):
     def forward(
         self,
         x: Int[torch.Tensor, "... seq_len"],
-        token_positions: Int[torch.Tensor, "... seq_len"],
+        token_positions: Int[torch.Tensor, "... seq_len"] | None = None,
     ) -> Float[torch.Tensor, "... seq_len vocab_size"]:
+        if token_positions is None:
+            seq_len = x.size(-1)
+            token_positions = torch.arange(seq_len, device=x.device)
+
         h = self.tok_embeddings(x)
 
-        for transformer_block in self.tranformer_blocks:
+        for transformer_block in self.transformer_blocks:
             h = transformer_block(h, token_positions)
 
         h = self.norm(h)

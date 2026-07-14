@@ -11,8 +11,19 @@ def save_checkpoint(
     optimizer_args: dict,
     loss: float,
     step: int,
-    out: str | os.PathLike | typing.BinaryIO | typing.IO[bytes],
+    out: str | os.PathLike,
 ) -> None:
+    """
+    O dado modelo e sua configuração, otimizador e sua configuração e o número da iteração é serializado no disco.
+
+    Args:
+        model (torch.nn.Module): Serializa o estado do modelo.
+        optimizer (torch.optim.Optimizer): Serializa o estado do otimizador.
+        model_args (dict): Serializa a configuração necessária para o modelo.
+        optimizer_args (dict): Serializa a configuração necessária para o otimizador.
+        step (int): Serializa o número de iterações de treinamento.
+        out (str | os.PathLike): Caminho para a serialização do modelo e sua configuração, otimizador e sua configuração e o número da iteração no disco
+    """
     model_state_dict = model.state_dict()
     optimizer_state_dict = optimizer.state_dict()
 

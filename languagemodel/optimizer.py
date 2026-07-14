@@ -1,4 +1,5 @@
 import math
+from collections.abc import Iterable
 
 import torch
 
@@ -6,17 +7,26 @@ import torch
 class AdamW(torch.optim.Optimizer):
     def __init__(
         self,
-        params,
-        lr: float,
-        betas: list[float],
-        weight_decay: float,
-        eps: float,
+        params: Iterable[torch.nn.parameter.Parameter],
+        lr: float = 1e-3,
+        betas: tuple[float, float] = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
     ):
+        if not 0.0 <= lr:
+            raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= eps:
+            raise ValueError(f"Invalid epsilon value: {eps}")
+        if not 0.0 <= betas[0] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 0: {betas[0]}")
+        if not 0.0 <= betas[1] < 1.0:
+            raise ValueError(f"Invalid beta parameter at index 1: {betas[1]}")
+
         defaults = {
             "lr": lr,
             "betas": betas,
-            "weight_decay": weight_decay,
             "eps": eps,
+            "weight_decay": weight_decay,
         }
 
         super().__init__(params, defaults)
@@ -35,67 +45,88 @@ class AdamW(torch.optim.Optimizer):
                     continue
 
                 grad = p.grad.data
+                if grad.is_sparse:
+                    raise RuntimeError("Adam does not support sparse gradients")
+
                 state = self.state[p]
 
                 t = state.get("t", 1)
-                m = state.get(
-                    "m",
-                    torch.zeros(
-                        p.data.shape, device=p.data.device, dtype=p.data.dtype
-                    ),
-                )
-                v = state.get(
-                    "v",
-                    torch.zeros(
-                        p.data.shape, device=p.data.device, dtype=p.data.dtype
-                    ),
-                )
 
                 lr_t = lr * (math.sqrt(1 - beta_2**t) / (1 - beta_1**t))
 
                 p.data -= lr * weight_decay * p.data
 
-                m = beta_1 * m + (1 - beta_1) * grad
-                v = beta_2 * v + (1 - beta_2) * grad**2
+                prev_m_t = state.get(
+                    "m",
+                    torch.zeros(
+                        p.data.shape, device=p.data.device, dtype=torch.float32
+                    ),
+                )
+                prev_v_t = state.get(
+                    "v",
+                    torch.zeros(
+                        p.data.shape, device=p.data.device, dtype=torch.float32
+                    ),
+                )
 
-                p.data -= lr_t * (m / (v.sqrt() + eps))
+                m_t = beta_1 * prev_m_t + (1 - beta_1) * grad
+                v_t = beta_2 * prev_v_t + (1 - beta_2) * grad**2
+
+                p.data -= lr_t * m_t / (v_t.sqrt() + eps)
 
                 state["t"] = t + 1
-                state["m"] = m
-                state["v"] = v
+                state["m"] = m_t
+                state["v"] = v_t
 
         return loss
 
 
 def get_lr_cosine_schedule(
-    t: int, lr_min: float, lr_max: float, t_w: int, t_c: int
+    it: int,
+    min_learning_rate: float,
+    max_learning_rate: float,
+    warmup_iters: int,
+    cosine_cycle_iters: int,
 ) -> float:
     """
+    Dado os parâmetros do cosine learning decay schedule (com linear warmup) e o número da iteração, retorna o learning rate na iteração especificada, de acordo com o schedule definido.
+
     Args:
-        t:
-        lr_min:
-        lr_max:
-        t_w:
-        t_c:
+        it (int): Número da iteração que se deseja obter o learning rate.
+        min_learning_rate (float): alpha_max, o maior valor para o learning rate para o cosine learning schedule (com warmup).
+        max_learning_rate (float): alpha_min, o menor valor para o learning rate para o cosine learning schedule (com warmup).
+        warmup_iters (int): T_w, número de iterações da etapa de warmup.
+        cosine_cycle_iters (int): T_c, número de iteações da etapa de cosine annealing.
+
+    Returns:
+        Learning rate na iteração especificada, de acordo com o schedule definido.
     """
-    if t < t_w:
-        lr = (t / t_w) * lr_max
-    elif t_w <= t <= t_c:
-        decay_ratio = (t - t_w) / (t_c - t_w)
-        lr = lr_min + 0.5 * (1.0 + math.cos(decay_ratio * math.pi)) * (
-            lr_max - lr_min
-        )
+    if it < warmup_iters:
+        lr = (it / warmup_iters) * max_learning_rate
+    elif warmup_iters <= it <= cosine_cycle_iters:
+        decay_ratio = (it - warmup_iters) / (cosine_cycle_iters - warmup_iters)
+        lr = min_learning_rate + 0.5 * (
+            1.0 + math.cos(decay_ratio * math.pi)
+        ) * (max_learning_rate - min_learning_rate)
     else:
-        lr = lr_min
+        lr = min_learning_rate
 
     return lr
 
 
 @torch.no_grad()
-def gradient_clipping(parameters: list, l2_norm_max: float):
-    if not isinstance(parameters, list):
-        raise ValueError("Parameters deve ser uma lista.")
+def gradient_clipping(
+    parameters: Iterable[torch.nn.Parameter], max_l2_norm: float
+) -> None:
+    """
+    Dado um conjunto de parâmetros, limita seus gradientes combinados de modo que l2 norm seja, no máximo, "max_l2_norm".
 
+    Args:
+        parameters (Iterable[torch.nn.Parameter]): Conjunto de parâmetros treináveis.
+        max_l2_norm (float): Valor positivo máximo para a l2 norm.
+
+    Os gradientes são modificados de forma in-place.
+    """
     eps = 1e-6
 
     grad = torch.cat(
@@ -109,8 +140,8 @@ def gradient_clipping(parameters: list, l2_norm_max: float):
 
     l2_norm = (grad**2).sum().sqrt()
 
-    if l2_norm > l2_norm_max:
-        factor = l2_norm_max / (l2_norm + eps)
-        for p in parameters:
-            if p.grad is not None:
-                p.grad.mul_(factor)
+    clip_coef = min(1, max_l2_norm / (l2_norm + eps))
+
+    for p in parameters:
+        if p.grad is not None:
+            p.grad *= clip_coef

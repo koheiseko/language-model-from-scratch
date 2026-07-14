@@ -18,6 +18,7 @@ def sample(
 
         probs_cumsum = probs_sort.cumsum(dim=-1)
         probs_sort.masked_fill_(probs_cumsum - probs_sort > top_p_threshold, 0)
+        probs /= probs.sum(-1, keepdim=True)
         probs_sort.div_(torch.empty_like(probs_sort).exponential_(1))
 
         next_token_idx = probs_sort.argmax(dim=-1, keepdim=True)
@@ -45,7 +46,7 @@ def generate(
     total_len = len(prompt_tokens) + max_new_tokens
 
     tokens = torch.full((total_len,), -1, device=device, dtype=torch.long)
-    tokens[: len(prompt_tokens)] = torch.Tensor(prompt_tokens)
+    tokens[: len(prompt_tokens)] = torch.tensor(prompt_tokens)
     token_positions = torch.arange(total_len, device=device)
 
     for cur_pos in range(len(prompt_tokens), total_len, 1):

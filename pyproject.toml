@@ -5,8 +5,8 @@ description = "Este projeto tem o objetivo de implementar um modelo de linguagem
 readme = "README.md"
 requires-python = ">=3.12,<3.14"
 dependencies = [
-    "einops>=0.8",      
-    "jaxtyping>=0.3",   
+    "einops>=0.8",
+    "jaxtyping>=0.3",
     "numpy>=2.4",
     "regex>=2026.3.32",
     "tiktoken>=0.12.0",
@@ -15,10 +15,12 @@ dependencies = [
     "wandb>=0.25",
     "ty>=0.0.26",
     "ruff>=0.15.8",
-    "tokenizers>=0.23.1",
-    "datasets>=4.8.5",
+    "datasets==3.6.0",
     "scikit-learn>=1.9.0",
     "reportlab>=4.5.1",
+    "lxml>=6.1.1",
+    "transformers>=4.31.0",
+    "tokenizers>=0.22.2",
 ]
 
 [build-system]
@@ -36,9 +38,6 @@ module-root = ""
 members = [
     ".",
 ]
-
-[tool.uv.sources]
-cs336-basics = { workspace = true }
 
 [tool.uv]
 package = true

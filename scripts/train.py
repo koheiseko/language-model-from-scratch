@@ -10,7 +10,7 @@ from tqdm.auto import tqdm
 
 import languagemodel.functional as F
 from languagemodel.checkpoint_manager import load_checkpoint, save_checkpoint
-from languagemodel.data import data_loading
+from languagemodel.dataloader import data_loading
 from languagemodel.model import Transformer
 from languagemodel.optimizer import (
     AdamW,
@@ -28,22 +28,24 @@ def parse_args():
     # --- Dados ---
     parser.add_argument(
         "--train_dataset_path",
+        default="../data/tinystories/processed/train.bin",
         type=str,
         help="Path para o dataset de treinamento",
     )
     parser.add_argument(
         "--val_dataset_path",
+        default="../data/tinystories/processed/val.bin",
         type=str,
         help="Path para o dataset de validação",
     )
 
     parser.add_argument(
-        "--array_dtype", type=str, default="int32", help="Data type do array"
+        "--array_dtype", type=str, default="uint16", help="Data type do array"
     )
 
     # --- Arquitetura do Modelo ---
     parser.add_argument(
-        "--vocab_size", type=int, default=10_000, help="Tamanho do vocabulário"
+        "--vocab_size", type=int, default=32_000, help="Tamanho do vocabulário"
     )
     parser.add_argument(
         "--context_length", type=int, default=256, help="Tamanho do contexto"
@@ -66,10 +68,10 @@ def parse_args():
 
     # --- Treinamento ---
     parser.add_argument(
-        "--n_steps", type=int, default=20_000, help="Número de épocas"
+        "--n_steps", type=int, default=20_000, help="Número de steps"
     )
     parser.add_argument(
-        "--batch_size", type=int, default=32, help="Tamanho do batch"
+        "--batch_size", type=int, default=16, help="Tamanho do batch"
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Seed de aleatoriedade"
@@ -83,7 +85,7 @@ def parse_args():
     parser.add_argument(
         "--dtype",
         type=str,
-        default="float32",
+        default="bfloat16",
         help="Tipo de dado do PyTorch (ex: float32, float16, bfloat16)",
     )
 
@@ -130,22 +132,28 @@ def parse_args():
         help="Parâmetros beta para o otimizador",
     )
     parser.add_argument(
-        "--lr_min",
+        "--min_learning_rate",
         type=float,
         default=5e-5,
         help="Learning rate mínimo",
     )
     parser.add_argument(
-        "--lr_max",
+        "--max_learning_rate",
         type=float,
         default=5e-4,
         help="Learning rate máximo",
     )
     parser.add_argument(
-        "--t_w",
+        "--warmup_iters",
         type=int,
         default=1_000,
         help="Período aonde o warmup está ativado",
+    )
+    parser.add_argument(
+        "--cosine_cycle_iters",
+        type=int,
+        default=20_000,
+        help="Período aonde o cosine cycle está ativado",
     )
     parser.add_argument(
         "--weight_decay", type=float, default=0.1, help="Decaimento de peso"
@@ -265,7 +273,7 @@ def train():
 
     optimizer_args = {
         "betas": args.betas,
-        "lr": args.lr_min,
+        "lr": args.min_learning_rate,
         "weight_decay": args.weight_decay,
         "eps": 1e-8,
     }
@@ -303,40 +311,50 @@ def train():
 
         starting_step = 0
 
+    total_parameters = sum([p.numel() for p in model.parameters()])
+    logger.info(
+        f"Quantidade total de parâmetros do modelo: {total_parameters / 1_000_000} milhões"
+    )
+
     if args.torch_compile:
         model = torch.compile(
             model, dynamic=False
         )  # dynamic=False pois o shape das entradas sempre serão o mesmo
 
     progress_bar = tqdm(
-        range(starting_step, args.n_steps), desc="Treinando o modelo"
+        range(starting_step, args.n_steps),
+        initial=starting_step,
+        total=args.n_steps,
+        desc="Treinando o modelo",
     )
 
     total_steps = args.n_steps - starting_step
 
     logger.info("COMEÇANDO O TREINAMENTO")
-    logger.info(f"  Número de Steps = {total_steps}")
+    logger.info(f"  Número de Total de Steps = {total_steps}")
+
+    train_dataset = np.memmap(
+        filename=args.train_dataset_path, mode="r", dtype=args.array_dtype
+    )
+    val_dataset = np.memmap(
+        filename=args.val_dataset_path, mode="r", dtype=args.array_dtype
+    )
 
     total_loss = 0
-    token_positions = (
-        torch.arange(0, args.context_length, dtype=torch.long, pin_memory=True)
-        .to(args.device, non_blocking=True)
-        .unsqueeze(0)
-    )  # A posição dos tokens é pré-calculada pois todas as entradas terão a mesma quantidade de tokens
     model.train()
     for step in progress_bar:
         # -----------------------------------------------------------
         # etapa de avaliação por val_steps
 
         if args.val_interval > 0 and (
-            step % args.val_interval == 0 or step == total_steps
+            step % args.val_interval == 0 or step == args.n_steps - 1
         ):
+            model.eval()
             with torch.no_grad():
-                model.eval()
-                val_losses = torch.empty(args.val_steps)
-                for i in range(args.val_steps):
+                total_val_loss = 0
+                for _ in range(args.val_steps):
                     x_batch, y_batch = data_loading(
-                        filename=args.val_dataset_path,
+                        dataset=val_dataset,
                         array_dtype=args.array_dtype,
                         batch_size=args.batch_size,
                         context_length=args.context_length,
@@ -347,26 +365,22 @@ def train():
                         y_batch.to(args.device, non_blocking=True),
                     )
 
-                    x_batch_token_positions = token_positions.expand_as(x_batch)
-
                     with torch.amp.autocast(
                         device_type=args.device, dtype=args.dtype
                     ):
-                        logits = model(
-                            x=x_batch, token_positions=x_batch_token_positions
-                        )
-                        val_batch_loss = F.cross_entropy_loss(
-                            logits=logits, target=y_batch
+                        logits = model(x=x_batch)
+                        val_batch_loss = F.cross_entropy(
+                            inputs=logits, targets=y_batch
                         )
 
-                    val_losses[i] = val_batch_loss.item()
+                    total_val_loss += val_batch_loss.detach()
                 model.train()
 
-                val_loss = val_losses.mean()
-                val_perplexity = F.perplexity(val_losses)
+                val_loss = total_val_loss / args.val_steps
+                val_perplexity = val_loss.exp()
 
                 logger.info(
-                    f"Step {step}: val/loss: {val_loss}, val/perplexity: {val_perplexity}"
+                    f"Step {step}: val/loss: {val_loss.item()}, val/perplexity: {val_perplexity.item()}"
                 )
 
                 if args.wandb_log:
@@ -402,7 +416,7 @@ def train():
         loss_accumulation = 0
         for _micro_step in range(args.gradient_accumulation_steps):
             x_batch, y_batch = data_loading(
-                filename=args.train_dataset_path,
+                dataset=train_dataset,
                 array_dtype=args.array_dtype,
                 batch_size=args.batch_size,
                 context_length=args.context_length,
@@ -413,13 +427,9 @@ def train():
                 y_batch.to(args.device, non_blocking=True),
             )
 
-            x_batch_token_positions = token_positions.expand_as(x_batch)
-
             with torch.amp.autocast(device_type=args.device, dtype=args.dtype):
-                logits = model(
-                    x=x_batch, token_positions=x_batch_token_positions
-                )
-                loss = F.cross_entropy_loss(logits=logits, target=y_batch)
+                logits = model(x=x_batch)
+                loss = F.cross_entropy(inputs=logits, targets=y_batch)
 
             loss /= args.gradient_accumulation_steps
             loss_accumulation += loss.detach()
@@ -430,11 +440,11 @@ def train():
                 loss.backward()
 
         lr = get_lr_cosine_schedule(
-            lr_min=args.lr_min,
-            lr_max=args.lr_max,
-            t=step,
-            t_w=args.t_w,
-            t_c=args.n_steps,
+            it=step,
+            min_learning_rate=args.min_learning_rate,
+            max_learning_rate=args.max_learning_rate,
+            warmup_iters=args.warmup_iters,
+            cosine_cycle_iters=args.cosine_cycle_iters,
         )
 
         for group in optimizer.param_groups:
@@ -458,11 +468,25 @@ def train():
 
         optimizer.zero_grad(set_to_none=True)
 
-        if step % args.log_interval == 0 or step == total_steps:
+        if step == args.n_steps - 1:
+            save_checkpoint(
+                model=model._orig_mod if hasattr(model, "_orig_mod") else model,
+                optimizer=optimizer,
+                model_args=model_args,
+                optimizer_args=optimizer_args,
+                loss=loss_accumulation,
+                step=step,
+                out=os.path.join(
+                    args.out_dir,
+                    f"final_ckpt_{time.strftime('%d%m%Y_%H%M%S')}.pt",
+                ),
+            )
+
+        if step % args.log_interval == 0 or step == args.n_steps - 1:
             train_loss = (
                 total_loss / args.log_interval if step != 0 else total_loss
             )
-            train_perplexity = F.perplexity(train_loss)
+            train_perplexity = train_loss.exp()
             total_loss = 0
 
             if args.wandb_log:
@@ -474,19 +498,6 @@ def train():
                     },
                     step=step,
                 )
-
-    save_checkpoint(
-        model=model._orig_mod if hasattr(model, "_orig_mod") else model,
-        optimizer=optimizer,
-        model_args=model_args,
-        optimizer_args=optimizer_args,
-        loss=loss_accumulation,
-        step=step,
-        out=os.path.join(
-            args.out_dir,
-            f"final_ckpt_{time.strftime('%d%m%Y_%H%M%S')}.pt",
-        ),
-    )
 
     wandb.finish()
 
