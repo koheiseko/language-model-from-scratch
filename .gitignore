@@ -10,4 +10,4 @@ wheels/
 .venv
 
 wandb/
-outputs
+outputsdata/tinystories/processed/*.bin
