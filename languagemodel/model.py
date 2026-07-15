@@ -1,4 +1,5 @@
 import math
+import warnings
 
 import einops
 import torch
@@ -7,7 +8,6 @@ from jaxtyping import Bool, Float, Int
 
 from languagemodel.functional import softmax
 
-# Tornar o RoPE injetável, pois um único objeto  pode ser usado em todas as leyers, tornado desnecessário o instanciamento dela em cada layer.
 
 class Linear(nn.Module):
     def __init__(
@@ -65,7 +65,7 @@ class Linear(nn.Module):
         )
 
     def extra_repr(self):
-        return f"in_features={self.weight.shape[1]}, out_features={self.weight.shape[0]}"
+        return f"in_features={self.weight.shape[1]}, out_features={self.weights.shape[0]}"
 
 
 class Embedding(nn.Module):
@@ -111,7 +111,7 @@ class Embedding(nn.Module):
         return self.weights[token_ids, :]
 
     def extra_repr(self):
-        return f"vocab_size={self.weight.shape[0]}, embedding_dim={self.weight.shape[1]}"
+        return f"vocab_size={self.weight.shape[0]}, embedding_dim={self.weights.shape[1]}"
 
 
 class RMSNorm(nn.Module):
@@ -214,7 +214,7 @@ class RotaryPositionalEmbedding(nn.Module):
         self,
         theta: float,
         dim: int,
-        max_seq_len: int,
+        context_length: int,
         device: torch.device | None = None,
     ):
         """
@@ -232,70 +232,125 @@ class RotaryPositionalEmbedding(nn.Module):
         """
         super().__init__()
 
-        pairs_counts = torch.arange(0, dim // 2, device=device)
-        t = torch.arange(max_seq_len, device=device)
-        inv_freq = theta ** ((-2 * pairs_counts) / dim)
-        freqs = torch.outer(t, inv_freq)
+        self.register_buffer(
+            "_freq_cis_cache",
+            RotaryPositionalEmbedding._init_cache(
+                context_length, dim, theta, device
+            ),
+            persistent=False,
+        )
+
+        self._freq_cis_cache: Float[
+            torch.Tensor,
+            "2 max_seq_length half_dim",
+        ]
+
+    @staticmethod
+    def _init_cache(
+        context_length: int,
+        dim: int,
+        theta: float,
+        device: torch.device | None = None,
+    ) -> Float[torch.Tensor, " 2 context_length half_dim"]:
+        if dim % 2 != 0:
+            raise ValueError(
+                f'O valor de "dim" deve ser par, mas recebeu {dim}.'
+            )
+
+        pairs_counts = (
+            torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim
+        )
+        t = torch.arange(context_length, dtype=torch.float32, device=device)
+        freqs = theta**-pairs_counts
+
+        freqs = einops.einsum(
+            t,
+            freqs,
+            "t, f -> t f",
+        )
 
         cos, sin = freqs.cos(), freqs.sin()
 
-        self.register_buffer(
-            "cos",
-            torch.repeat_interleave(cos, repeats=2, dim=-1),
-            persistent=False,
-        )
-        self.register_buffer(
-            "sin",
-            torch.repeat_interleave(sin, repeats=2, dim=-1),
-            persistent=False,
-        )
+        return torch.stack((cos, sin))
 
     def forward(
         self,
-        x: Float[torch.Tensor, "... sequence_length dim"],
-        token_positions: Int[torch.Tensor, "... sequence_length"],
-    ) -> Float[torch.Tensor, "... sequence_length dim"]:
+        x: Float[
+            torch.Tensor,
+            "... sequence_length dim",
+        ],
+        token_positions: Int[
+            torch.Tensor,
+            "... sequence_length",
+        ]
+        | None = None,
+    ) -> Float[
+        torch.Tensor,
+        "... sequence_length dim",
+    ]:
         """
-
-
         Args:
             x:
             token_positions:
         """
+        if x.size(-1) % 2 != 0:
+            raise ValueError(
+                f"A última dimensão de `x` deve ser par, mas recebeu {x.size(-1)}."
+            )
+
         x1, x2 = x[..., 0::2], x[..., 1::2]
-        x_rh = einops.rearrange(
-            torch.stack([-x2, x1], dim=-1),
-            "... sequence_length half_dim pair -> ... sequence_length (half_dim pair)",
-        )
 
-        cos = self.cos.to(x.dtype)
-        sin = self.sin.to(x.dtype)
+        if token_positions is not None:
+            cos, sin = self._freq_cis_cache[
+                :,
+                token_positions,
+                :,
+            ].unbind(0)
 
-        x = x * cos[token_positions, :].unsqueeze(-3) + x_rh * sin[
-            token_positions, :
-        ].unsqueeze(-3)
+        else:
+            seq_len = x.size(-2)
 
-        return x
+            if seq_len > self._freq_cis_cache.size(1):
+                raise ValueError(
+                    f"Comprimento da sequência ({seq_len}) excede "
+                    f"max_seq_len ({self._freq_cis_cache.size(1)})."
+                )
 
-    def extra_repr(self):
-        return f"context_length={self._freq_cis_cache.shape[0]}, dim/2={self._freq_cis_cache.shape[1]}"
+            cos, sin = self._freq_cis_cache[
+                :,
+                :seq_len,
+                :,
+            ].unbind(0)
+
+        cos = cos.to(dtype=x.dtype, device=x.device)
+        sin = sin.to(dtype=x.dtype, device=x.device)
+
+        x1_rot = x1 * cos - x2 * sin
+        x2_rot = x2 * sin + x1 * cos
+
+        result = torch.stack((x1_rot, x2_rot), dim=-1).flatten(-2)
+
+        return result
+
 
 def scaled_dot_product_attention(
     query: Float[torch.Tensor, "... queries d_k"],
     key: Float[torch.Tensor, "  ... keys    d_k"],
     value: Float[torch.Tensor, "... keys    d_v"],
     is_causal: bool,
-    attn_mask: Bool[torch.Tensor, " ... queries keys"] | None = None,
+    attn_mask: Bool[torch.Tensor, " ... queries keys"]
+    | Float[torch.Tensor, "... queries keys"]
+    | None = None,
 ) -> Float[torch.Tensor, "... queries d_v"]:
     """
     Esta função implementa o Scaled Dot Product Attention (SDPA).
 
     Args:
-        query: Tensor de queries, pode ter qualquer número de dimensões iniciais. 
+        query: Tensor de queries, pode ter qualquer número de dimensões iniciais.
         key: Tensor de keys, compartilha o número de dimensões iniciais com "query".
-        value: Tensor de values, 
+        value: Tensor de values,
         is_causal:
-        attn_mask: 
+        attn_mask:
 
     Returns:
     """
@@ -308,7 +363,9 @@ def scaled_dot_product_attention(
     attn_bias = torch.zeros((queries, keys), dtype=dtype, device=device)
 
     if is_causal:
-        assert attn_mask is None, "attn_mask não pode ser passado junto com is_causal=True"
+        assert attn_mask is None, (
+            "attn_mask não pode ser passado junto com is_causal=True"
+        )
 
         temp_mask = torch.ones_like(attn_bias, dtype=torch.bool).triu_(
             diagonal=1
@@ -317,7 +374,7 @@ def scaled_dot_product_attention(
 
     if attn_mask is not None:
         if attn_mask.dtype == torch.bool:
-            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
+            attn_bias.masked_fill(attn_mask.logical_not(), float("-inf"))
         else:
             attn_bias = attn_bias + attn_mask
 
@@ -344,8 +401,7 @@ class MultiHeadAttention(nn.Module):
         self,
         d_model: int,
         num_heads: int,
-        max_seq_len: int,
-        theta: float,
+        positional_encoder: RotaryPositionalEmbedding | None,
         eps: float,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
@@ -371,18 +427,19 @@ class MultiHeadAttention(nn.Module):
             o_proj:
         """
         super().__init__()
+        if positional_encoder is None:
+            warnings.warn(
+                "Positional encoder não foi identificado", stacklevel=2
+            )
 
-        assert d_model % num_heads == 0, 'O valor de "d_model" deve ser divisível pelo valor de "num_heads."'
+        assert d_model % num_heads == 0, (
+            'O valor de "d_model" deve ser divisível pelo valor de "num_heads."'
+        )
 
         self.head_dim = d_model // num_heads
         self.num_heads = num_heads
 
-        self.rope = RotaryPositionalEmbedding(
-            theta=theta,
-            dim=self.head_dim,
-            max_seq_len=max_seq_len,
-            device=device,
-        )
+        self.positional_encoder = positional_encoder  # RoPE
 
         # QK-Norm
         self.q_norm = RMSNorm(
@@ -437,8 +494,15 @@ class MultiHeadAttention(nn.Module):
         query = self.q_norm(query)
         key = self.k_norm(key)
 
-        query = self.rope(query, token_positions)
-        key = self.rope(key, token_positions)
+        if self.positional_encoder is not None:
+            if token_positions is not None:
+                token_positions = einops.rearrange(
+                    token_positions,
+                    "... sequence_length -> ... 1 sequence_length",
+                )
+
+            query = self.positional_encoder(query, token_positions)
+            key = self.positional_encoder(key, token_positions)
 
         attn = scaled_dot_product_attention(
             query, key, value, is_causal=is_causal
@@ -458,8 +522,7 @@ class TransformerBlock(nn.Module):
         d_model: int,
         d_ff: int,
         num_heads: int,
-        max_seq_len: int,
-        theta: float,
+        positional_encoder: RotaryPositionalEmbedding | None,
         eps: float,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
@@ -487,15 +550,13 @@ class TransformerBlock(nn.Module):
 
         self.d_model = d_model
         self.d_ff = d_ff
-        self.max_seq_len = max_seq_len
         self.num_heads = num_heads
         self.device = device
 
         self.mha = MultiHeadAttention(
             d_model=d_model,
             num_heads=num_heads,
-            max_seq_len=max_seq_len,
-            theta=theta,
+            positional_encoder=positional_encoder,
             eps=eps,
             device=device,
             dtype=dtype,
@@ -570,14 +631,22 @@ class Transformer(nn.Module):
             dtype=dtype,
         )
 
+        d_head = d_model // num_heads
+
+        self.positional_encoder = RotaryPositionalEmbedding(
+            context_length=context_length,
+            dim=d_head,
+            theta=theta,
+            device=device,
+        )
+
         self.transformer_blocks = nn.ModuleList(
             [
                 TransformerBlock(
                     d_model=d_model,
                     d_ff=d_ff,
                     num_heads=num_heads,
-                    max_seq_len=context_length,
-                    theta=theta,
+                    positional_encoder=self.positional_encoder,
                     eps=eps,
                     device=device,
                     dtype=dtype,
