@@ -21,6 +21,7 @@ dependencies = [
     "lxml>=6.1.1",
     "transformers>=4.31.0",
     "tokenizers>=0.22.2",
+    "marimo>=0.23.14",
 ]
 
 [build-system]

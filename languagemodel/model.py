@@ -1,10 +1,10 @@
 import math
-import warnings
 
 import einops
 import torch
 import torch.nn as nn
 from jaxtyping import Bool, Float, Int
+import warnings
 
 from languagemodel.functional import softmax
 
@@ -257,9 +257,7 @@ class RotaryPositionalEmbedding(nn.Module):
                 f'O valor de "dim" deve ser par, mas recebeu {dim}.'
             )
 
-        pairs_counts = (
-            torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim
-        )
+        pairs_counts = torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim
         t = torch.arange(context_length, dtype=torch.float32, device=device)
         freqs = theta**-pairs_counts
 
@@ -338,9 +336,7 @@ def scaled_dot_product_attention(
     key: Float[torch.Tensor, "  ... keys    d_k"],
     value: Float[torch.Tensor, "... keys    d_v"],
     is_causal: bool,
-    attn_mask: Bool[torch.Tensor, " ... queries keys"]
-    | Float[torch.Tensor, "... queries keys"]
-    | None = None,
+    attn_mask: Bool[torch.Tensor, " ... queries keys"] | Float[torch.Tensor, "... queries keys"] | None = None,
 ) -> Float[torch.Tensor, "... queries d_v"]:
     """
     Esta função implementa o Scaled Dot Product Attention (SDPA).
@@ -354,29 +350,9 @@ def scaled_dot_product_attention(
 
     Returns:
     """
-    device, dtype = query.device, query.dtype
-
     queries, keys = query.size(-2), key.size(-2)
     d_k = key.size(-1)
     scale_factor = 1 / math.sqrt(d_k)
-
-    attn_bias = torch.zeros((queries, keys), dtype=dtype, device=device)
-
-    if is_causal:
-        assert attn_mask is None, (
-            "attn_mask não pode ser passado junto com is_causal=True"
-        )
-
-        temp_mask = torch.ones_like(attn_bias, dtype=torch.bool).triu_(
-            diagonal=1
-        )
-        attn_bias.masked_fill_(temp_mask, float("-inf"))
-
-    if attn_mask is not None:
-        if attn_mask.dtype == torch.bool:
-            attn_bias.masked_fill(attn_mask.logical_not(), float("-inf"))
-        else:
-            attn_bias = attn_bias + attn_mask
 
     attn_scores = (
         einops.einsum(
@@ -386,7 +362,27 @@ def scaled_dot_product_attention(
         )
         * scale_factor
     )
-    attn_scores += attn_bias
+
+    if is_causal:
+        if attn_mask is not None:
+            raise ValueError(
+                "attn_mask não pode ser passado junto com is_causal=True"
+            )
+
+        causal_mask = torch.ones(queries, keys, dtype=torch.bool, device=query.device).triu(
+            diagonal=1
+        )
+        attn_scores.masked_fill_(causal_mask, float("-inf"))
+
+    if attn_mask is not None:
+        if attn_mask.device != query.device:
+            attn_mask = attn_mask.to(query.device)
+
+        if attn_mask.dtype == torch.bool:
+            attn_scores.masked_fill_(attn_mask.logical_not(), float("-inf"))
+        else:
+            attn_scores = attn_scores + attn_mask.to(dtype=attn_scores.dtype)
+
     attn_weights = softmax(attn_scores, dim=-1)
 
     return einops.einsum(
@@ -439,7 +435,7 @@ class MultiHeadAttention(nn.Module):
         self.head_dim = d_model // num_heads
         self.num_heads = num_heads
 
-        self.positional_encoder = positional_encoder  # RoPE
+        self.positional_encoder = positional_encoder # RoPE
 
         # QK-Norm
         self.q_norm = RMSNorm(
@@ -465,8 +461,9 @@ class MultiHeadAttention(nn.Module):
     def forward(
         self,
         x: Float[torch.Tensor, "... sequence_length d_model"],
-        token_positions: Int[torch.Tensor, "... sequence_length"],
+        token_positions: Int[torch.Tensor, "... sequence_length"] | None = None,
         is_causal: bool = True,
+        attn_mask: Bool[torch.Tensor, "... sequence_length sequence_length"] | Float[torch.Tensor, "... sequence_length sequence_length"] | None = None
     ) -> Float[torch.Tensor, "... sequence_length d_model"]:
         """
 
@@ -479,17 +476,17 @@ class MultiHeadAttention(nn.Module):
             self.q_proj(x),
             "... sequence_length (num_heads head_dim) -> ... num_heads sequence_length head_dim",
             num_heads=self.num_heads,
-        ).contiguous()
+        )
         key = einops.rearrange(
             self.k_proj(x),
             "... sequence_length (num_heads head_dim) -> ... num_heads sequence_length head_dim",
             num_heads=self.num_heads,
-        ).contiguous()
+        )
         value = einops.rearrange(
             self.v_proj(x),
             "... sequence_length (num_heads head_dim) -> ... num_heads sequence_length head_dim",
             num_heads=self.num_heads,
-        ).contiguous()
+        )
 
         query = self.q_norm(query)
         key = self.k_norm(key)
@@ -505,7 +502,7 @@ class MultiHeadAttention(nn.Module):
             key = self.positional_encoder(key, token_positions)
 
         attn = scaled_dot_product_attention(
-            query, key, value, is_causal=is_causal
+            query, key, value, is_causal=is_causal, attn_mask=attn_mask
         )
         attn = einops.rearrange(
             attn,
