@@ -22,7 +22,10 @@ def softmax(
 
 
 def cross_entropy(
-    inputs: Float[torch.Tensor, "... sequence_length vocab_size"],
+    inputs: Float[
+        torch.Tensor,
+        "... sequence_length vocab_size",
+    ],
     targets: Int[torch.Tensor, "... sequence_length"],
 ) -> Float[torch.Tensor, ""]:
     """
@@ -42,7 +45,11 @@ def cross_entropy(
         inputs.exp().sum(dim=-1, keepdim=True).log()
     )  # (... sequence_length)
 
-    target_logit = torch.gather(inputs, index=targets.unsqueeze(-1), dim=-1)
+    target_logit = torch.gather(
+        inputs,
+        index=targets.unsqueeze(-1),
+        dim=-1,
+    )
 
     losses = log_sum_exp - target_logit  # (... sequence_length)
 

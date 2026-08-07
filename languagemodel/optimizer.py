@@ -13,6 +13,29 @@ class AdamW(torch.optim.Optimizer):
         eps: float = 1e-8,
         weight_decay: float = 0.01,
     ):
+        """
+        Inicializa o otimizador Adam com weight decay desacoplado
+
+        O otimizador mantém, para cada parâmetro, médias móveis exponenciais do
+        gradiente e do quadrado do gradiente. Essas estimativas são utilizadas
+        para adaptar individualmente o tamanho das atualizações
+
+        Diferentemente da regularização L2 aplicada ao gradiente, o AdamW aplica
+        o weight decay diretamente aos parâmetros, antes da atualização
+        adaptativa
+
+        Args:
+            params: Iterable de parâmetros a serem otimizados ou de dicionários definindo grupos de parâmetros com configurações próprias
+            lr: Taxa de aprendizado base. Deve ser maior ou igual a zero
+            betas: Coeficientes utilizados nas médias móveis do gradiente e do gradiente ao quadrado. Ambos devem pertencer ao intervalo "[0, 1)"
+            eps: Constante adicionada ao denominador para melhorar a estabilidade numérica. Deve ser maior ou igual a zero
+            weight_decay: Coeficiente do decaimento desacoplado aplicado aos parâmetros. Normalmente deve ser maior ou igual a zero
+
+        Attributes:
+            param_groups: Grupos de parâmetros administrados pelo otimizador Cada grupo pode possuir valores próprios para "lr", "betas", "eps" e "weight_decay"
+            state: Estado mantido individualmente para cada parâmetro. Contém o número do passo e as médias móveis de primeira e segunda ordem
+            defaults: Valores padrão usados na criação dos grupos de parâmetros
+        """
         if not 0.0 <= lr:
             raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= eps:
@@ -32,6 +55,22 @@ class AdamW(torch.optim.Optimizer):
         super().__init__(params, defaults)
 
     def step(self, closure=None):
+        """
+        Executa uma etapa de atualização dos parâmetros
+
+        Para cada parâmetro que possui gradiente, o método atualiza as médias
+        móveis de primeira e segunda ordem, aplica o weight decay desacoplado e
+        realiza a atualização adaptativa com correção de viés
+
+        Os estados "m" e "v" são armazenados em "torch.float32" para melhorar a estabilidade numérica, inclusive quando os parâmetros utilizam "float16" ou "bfloat16".
+
+        Args:
+            closure: Função opcional que recalcula o modelo e retorna a loss.
+
+        Returns:
+            O valor retornado por "closure", quando ela é fornecida, caso
+            contrário, retorna "None".
+        """
         loss = None if closure is None else closure()
 
         for group in self.param_groups:
@@ -59,13 +98,17 @@ class AdamW(torch.optim.Optimizer):
                 prev_m_t = state.get(
                     "m",
                     torch.zeros(
-                        p.data.shape, device=p.data.device, dtype=torch.float32
+                        p.data.shape,
+                        device=p.data.device,
+                        dtype=torch.float32,
                     ),
                 )
                 prev_v_t = state.get(
                     "v",
                     torch.zeros(
-                        p.data.shape, device=p.data.device, dtype=torch.float32
+                        p.data.shape,
+                        device=p.data.device,
+                        dtype=torch.float32,
                     ),
                 )
 
@@ -116,7 +159,8 @@ def get_lr_cosine_schedule(
 
 @torch.no_grad()
 def gradient_clipping(
-    parameters: Iterable[torch.nn.Parameter], max_l2_norm: float
+    parameters: Iterable[torch.nn.Parameter],
+    max_l2_norm: float,
 ) -> None:
     """
     Dado um conjunto de parâmetros, limita seus gradientes combinados de modo que l2 norm seja, no máximo, "max_l2_norm".

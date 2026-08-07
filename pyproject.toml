@@ -52,7 +52,6 @@ addopts = "-s"
 [tool.ruff]
 line-length = 80
 
-
 [tool.ruff.lint]
 select = [
     "E",  
@@ -63,6 +62,7 @@ select = [
     "C4",
     "UP",  
 ]
+extend-select = ["E501"]
 extend-ignore = ["F722"]
 
 ignore = [
