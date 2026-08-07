@@ -11,4 +11,5 @@ wheels/
 
 wandb/
 *.bin
+*.tmp
 outputs

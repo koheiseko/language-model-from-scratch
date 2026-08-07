@@ -14,15 +14,27 @@ def save_checkpoint(
     out: str | os.PathLike,
 ) -> None:
     """
-    O dado modelo e sua configuração, otimizador e sua configuração e o número da iteração é serializado no disco.
+    Serializa o estado de um treinamento em um arquivo de checkpoint
+
+    O checkpoint contém os parâmetros e buffers persistentes do modelo, o
+    estado interno do otimizador, os argumentos necessários para reconstruir
+    ambos, a loss associada ao checkpoint e o passo atual do treinamento
+
+    O arquivo é salvo com "torch.save". Se já existir um arquivo no caminho
+    informado, ele será sobrescrito. O diretório pai deve existir antes da
+    chamada.
 
     Args:
-        model (torch.nn.Module): Serializa o estado do modelo.
-        optimizer (torch.optim.Optimizer): Serializa o estado do otimizador.
-        model_args (dict): Serializa a configuração necessária para o modelo.
-        optimizer_args (dict): Serializa a configuração necessária para o otimizador.
-        step (int): Serializa o número de iterações de treinamento.
-        out (str | os.PathLike): Caminho para a serialização do modelo e sua configuração, otimizador e sua configuração e o número da iteração no disco
+        model: Modelo cujo "state_dict" será salvo
+        optimizer: Otimizador cujo "state_dict" será salvo
+        model_args: Argumentos necessários para reconstruir o modelo antes de carregar seus parâmetros
+        optimizer_args: Argumentos necessários para reconstruir o otimizador antes de carregar seu estado
+        loss: Valor da loss associado ao checkpoint
+        step: Índice do passo de treinamento associado ao estado salvo
+        out: Caminho do arquivo no qual o checkpoint será armazenado
+
+    Returns:
+        "None".
     """
     model_state_dict = model.state_dict()
     optimizer_state_dict = optimizer.state_dict()
@@ -45,9 +57,29 @@ def load_checkpoint(
     optimizer_module: torch.optim.Optimizer,
     device: torch.device | None = None,
 ) -> dict:
+    """
+    Carrega um checkpoint e reconstrói o modelo e o otimizador
+
+    O arquivo é desserializado com "torch.load". Em seguida, o modelo e o otimizador são instanciados usando os argumentos armazenados no checkpoint, e seus estados são restaurados por meio de "load_state_dict"
+
+    Args:
+        src: Caminho para o checkpoint ou objeto binário aberto para leitura
+        model_module: Classe ou construtor do modelo. Deve aceitar os argumentos armazenados em "model_args"
+        optimizer_module: Classe ou construtor do otimizador. Deve aceitar o argumento "params" e os valores armazenados em "optimizer_args"
+        device: Device para o qual os tensores serializados serão remapeados durante o carregamento. Quando "None", preserva os dispositivos registrados no checkpoint
+
+    Returns:
+        Dicionário contendo:
+
+        - "model": modelo reconstruído com o estado carregado
+        - "optimizer": otimizador reconstruído com o estado carregado
+        - "step': passo de treinamento registrado no checkpoint
+    """
+
     checkpoint = torch.load(src, map_location=device)
 
     step = checkpoint["step"]
+    loss = checkpoint["loss"]
 
     model_args = checkpoint["model_args"]
     optimizer_args = checkpoint["optimizer_args"]
@@ -58,7 +90,32 @@ def load_checkpoint(
     model = model_module(**model_args)
     model.load_state_dict(model_state_dict)
 
-    optimizer = optimizer_module(params=model.parameters(), **optimizer_args)
+    param_dict = {
+        pn: p for pn, p in model.named_parameters() if p.requires_grad
+    }
+
+    decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
+    nodecay_params = [p for _, p in param_dict.items() if p.dim() < 2]
+
+    optim_group = [
+        {
+            "params": decay_params,
+            "weight_decay": optimizer_args["weight_decay"],
+        },
+        {
+            "params": nodecay_params,
+            "weight_decay": 0.0,
+        },
+    ]
+
+    optimizer = optimizer_module(params=optim_group, **optimizer_args)
     optimizer.load_state_dict(optimizer_state_dict)
 
-    return {"model": model, "optimizer": optimizer, "step": step}
+    return {
+        "model": model,
+        "optimizer": optimizer,
+        "model_args": model_args,
+        "optimizer_args": optimizer_args,
+        "loss": loss,
+        "step": step,
+    }

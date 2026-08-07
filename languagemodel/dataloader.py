@@ -9,17 +9,28 @@ def data_loading(
     batch_size: int = 32,
     context_length: int = 512,
     array_dtype: np.dtype | str | None = None,
-) -> tuple[torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
+    Amostra um batch de sequências para treinamento autorregressivo
+
+    Os tokens podem ser fornecidos diretamente por meio de um array NumPy ou carregados de um arquivo binário com "numpy.memmap". Exatamente uma dessas fontes deve ser informada
+
+    Para cada elemento do batch, a função escolhe aleatoriamente uma posição inicial e extrai "context_length" tokens consecutivos. Os targets são formados pelos mesmos intervalos deslocados uma posição para a direita
+
+    A amostragem é realizada com reposição, portanto duas linhas do batch podem corresponder à mesma posição inicial
 
     Args:
-        dataset:
-        filename:
-        batch_size:
-        context_length:
-        array_dtype:
-        tensor_dtype:
-        device:
+        dataset: Array unidimensional contendo a sequência completa de identificadores de tokens. Deve ser  fornecido somente quando "filename" for "None"
+        filename: Caminho para um arquivo binário contendo uma sequência contígua de tokens. O arquivo é aberto em modo somente leitura usando "numpy.memmap". Deve ser fornecido somente quando "dataset" for "None"
+        batch_size: Quantidade de sequências amostradas
+        context_length: Quantidade de tokens em cada sequência de entrada e target
+        array_dtype: Tipo numérico dos elementos armazenados no arquivo binário. É obrigatório quando "filename" é fornecido e não é utilizado quando "dataset" é passado diretamente.
+
+    Returns:
+        Tupla contendo:
+
+        - "ids": tensor "torch.long" com shape "(batch_size, context_length)"
+        - "targets": tensor "torch.long" com o mesmo shape, contendo os tokens de "ids" deslocados uma posição para a direita
     """
     if dataset is None and filename is None:
         raise ValueError(
