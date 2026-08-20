@@ -48,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--tokenizer-filename",
-        default="NousResearch/Llama-2-7b-hf",
+        default="nicholasKluge/TeenyTinyLlama-160m",
         help="Tokenizer no Hugging Face Hub ou caminho local.",
     )
     parser.add_argument(
@@ -169,14 +169,15 @@ def write_encodings(
     files: Mapping[Split, BinaryIO],
     dtype: np.dtype,
     stats: dict[Split, SplitStats],
+    eos_token_id: int,
 ) -> None:
     encodings: list[Encoding] = tokenizer.encode_batch(
         [text for _, text in batch],
-        add_special_tokens=True,
+        add_special_tokens=False,
     )
 
     for (split, _), encoding in zip(batch, encodings, strict=True):
-        token_ids = np.asarray(encoding.ids, dtype=dtype)
+        token_ids = np.asarray([*encoding.ids, eos_token_id], dtype=dtype)
         token_ids.tofile(files[split])
         stats[split].documents += 1
         stats[split].tokens += token_ids.size
@@ -223,6 +224,8 @@ def prepare(args: argparse.Namespace) -> dict[Split, SplitStats]:
     stats = {split: SplitStats() for split in SPLITS}
     processed_documents = 0
 
+    eos_token_id = tokenizer.token_to_id("</s>")
+
     try:
         with ExitStack() as stack:
             files = {
@@ -254,7 +257,14 @@ def prepare(args: argparse.Namespace) -> dict[Split, SplitStats]:
                     processed_documents += 1
 
                     if len(batch) == args.batch_size:
-                        write_encodings(batch, tokenizer, files, dtype, stats)
+                        write_encodings(
+                            batch=batch,
+                            tokenizer=tokenizer,
+                            files=files,
+                            dtype=dtype,
+                            stats=stats,
+                            eos_token_id=eos_token_id,
+                        )
                         batch.clear()
 
                     if (
@@ -269,7 +279,14 @@ def prepare(args: argparse.Namespace) -> dict[Split, SplitStats]:
                     break
 
             if batch:
-                write_encodings(batch, tokenizer, files, dtype, stats)
+                write_encodings(
+                    batch=batch,
+                    tokenizer=tokenizer,
+                    files=files,
+                    dtype=dtype,
+                    stats=stats,
+                    eos_token_id=eos_token_id,
+                )
 
         for split in SPLITS:
             os.replace(temporary[split], targets[split])
