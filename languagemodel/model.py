@@ -405,7 +405,7 @@ class RotaryPositionalEmbedding(nn.Module):
         sin = sin.to(dtype=x.dtype, device=x.device)
 
         x1_rot = x1 * cos - x2 * sin
-        x2_rot = x2 * sin + x1 * cos
+        x2_rot = x1 * sin + x2 * cos
 
         result = torch.stack((x1_rot, x2_rot), dim=-1).flatten(-2)
 
