@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import time
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -101,19 +102,19 @@ def parse_args():
     parser.add_argument(
         "--context_length",
         type=positive_int,
-        default=64,
+        default=512,
         help="Tamanho do contexto",
     )
     parser.add_argument(
         "--d_model",
         type=positive_int,
-        default=128,
+        default=512,
         help="Dimensão do modelo",
     )
     parser.add_argument(
         "--d_ff",
         type=positive_int,
-        default=320,
+        default=1344,
         help="Dimensão da camada feed-forward",
     )
     parser.add_argument(
@@ -125,14 +126,14 @@ def parse_args():
     parser.add_argument(
         "--num_layers",
         type=positive_int,
-        default=4,
+        default=6,
         help="Número de camadas",
     )
     parser.add_argument(
         "--theta",
         type=float,
         default=10_000,
-        help="Parâmetro theta",
+        help="Parâmetro theta do RoPE",
     )
 
     # --- Treinamento ---
@@ -153,13 +154,13 @@ def parse_args():
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Dispositivo (ex: cuda, cpu)",
+        help="Dispositivo (cuda ou cpu)",
     )
     parser.add_argument(
-        "--dtype",
+        "--amp_dtype",
         type=str,
         default="bfloat16",
-        help="Tipo de dado do PyTorch (ex: float32, float16, bfloat16)",
+        help="Precisão usada pelo autocast (float32, float16 ou bfloat16)",
     )
 
     parser.add_argument(
@@ -301,14 +302,14 @@ def parse_args():
 
     args = parser.parse_args()
 
-    if args.dtype == "float32":
-        args.dtype = torch.float32
-    elif args.dtype == "float16":
-        args.dtype = torch.float16
-    elif args.dtype == "bfloat16":
-        args.dtype = torch.bfloat16
+    if args.amp_dtype == "float32":
+        args.amp_dtype = torch.float32
+    elif args.amp_dtype == "float16":
+        args.amp_dtype = torch.float16
+    elif args.amp_dtype == "bfloat16":
+        args.amp_dtype = torch.bfloat16
     else:
-        raise ValueError(f"Dtype não suportado: {args.dtype}")
+        raise ValueError(f"Dtype não suportado: {args.amp_dtype}")
 
     return args
 
@@ -327,14 +328,30 @@ def train():
     if args.sample_interval > 0:
         tokenizer = Tokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
 
-    scaler = (
-        torch.amp.GradScaler(device=args.device)
-        if args.dtype == torch.float16
-        else None
+    amp_enabled = args.amp_dtype in (torch.float16, torch.bfloat16)
+    use_grad_scaler = amp_enabled and args.amp_dtype == torch.float16
+
+    if args.device == "cuda" and args.dtype == torch.bfloat16:
+        with torch.cuda.device(args.device):
+            if not torch.cuda.is_bf16_supported():
+                raise RuntimeError("A GPU selecionada não suporta BF16")
+
+    scaler = torch.amp.GradScaler(
+        args.device,
+        enabled=use_grad_scaler,
     )
 
-    if scaler is not None:
+    if use_grad_scaler:
         logger.info("GrandScaler ativada para treinamento em fp16")
+
+    def autocast_context():
+        if not amp_enabled:
+            return nullcontext()
+
+        return torch.autocast(
+            device_type=args.device,
+            dtype=args.dtype,
+        )
 
     if args.wandb_log:
         wandb.init(
@@ -380,7 +397,7 @@ def train():
             "theta": args.theta,
             "eps": 1e-6,
             "device": args.device,
-            "dtype": args.dtype,
+            "dtype": torch.float32,
         }
 
         optimizer_args = {
@@ -439,7 +456,7 @@ def train():
         args.batch_size * args.gradient_accumulation_steps,
     )
     logger.info(
-        "ENV   | device=%s | dtype=%s | compiled=%s",
+        "ENV   | device=%s | amp_dtype=%s | compiled=%s",
         args.device,
         str(args.dtype).removeprefix("torch."),
         args.torch_compile,
@@ -528,23 +545,18 @@ def train():
                     ),
                 )
 
-                with torch.amp.autocast(
-                    device_type=args.device,
-                    dtype=args.dtype,
-                ):
+                with autocast_context():
                     logits = model(x=x_batch)
                     loss = F.cross_entropy(
                         inputs=logits,
                         targets=y_batch,
                     )
 
-                loss /= args.gradient_accumulation_steps
+                    loss = loss / args.gradient_accumulation_steps
+
                 loss_accumulation += loss.detach()
 
-                if scaler is not None:
-                    scaler.scale(loss).backward()
-                else:
-                    loss.backward()
+                scaler.scale(loss).backward()
 
             lr = get_lr_cosine_schedule(
                 it=step,
@@ -568,25 +580,15 @@ def train():
                 refresh=False,
             )
 
-            if scaler is not None:
-                if args.gradient_clipping:
-                    scaler.unscale_(optimizer)
-                    gradient_clipping(
-                        list(model.parameters()),
-                        args.l2_norm_max,
-                    )
+            if args.gradient_clipping:
+                scaler.unscale_(optimizer)
+                gradient_clipping(
+                    list(model.parameters()),
+                    args.l2_norm_max,
+                )
 
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                if args.gradient_clipping:
-                    gradient_clipping(
-                        list(model.parameters()),
-                        args.l2_norm_max,
-                    )
-
-                optimizer.step()
-
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad(set_to_none=True)
 
             # -----------------------------------------------------------
@@ -625,10 +627,7 @@ def train():
                             ),
                         )
 
-                        with torch.amp.autocast(
-                            device_type=args.device,
-                            dtype=args.dtype,
-                        ):
+                        with autocast_context():
                             logits = model(x=x_batch)
                             val_batch_loss = F.cross_entropy(
                                 inputs=logits,
@@ -636,6 +635,7 @@ def train():
                             )
 
                         total_val_loss += val_batch_loss.detach()
+
                     model.train()
 
                     val_loss = total_val_loss / args.val_steps
@@ -715,16 +715,17 @@ def train():
                 sample_outputs = []
 
                 for prompt in prompts:
-                    response = tokenizer.decode(
-                        generate(
+                    with torch.inference_mode(), autocast_context():
+                        generated_tokens = generate(
                             model=model,
                             max_new_tokens=1,
                             eos_id=0,
                             prompt_tokens=tokenizer.encode(prompt).ids,
                             device=args.device,
                             temperature=0.0,
-                        ).tolist()
-                    )
+                        )
+
+                    response = tokenizer.decode(generated_tokens.tolist())
 
                     sample_outputs.append(f"  {prompt!r:<20} -> {response!r}")
 
