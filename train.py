@@ -102,7 +102,7 @@ def parse_args():
     parser.add_argument(
         "--context_length",
         type=positive_int,
-        default=512,
+        default=256,
         help="Tamanho do contexto",
     )
     parser.add_argument(
@@ -140,13 +140,13 @@ def parse_args():
     parser.add_argument(
         "--n_steps",
         type=positive_int,
-        default=150_000,
+        default=61_036,
         help="Número de steps",
     )
     parser.add_argument(
         "--batch_size",
         type=positive_int,
-        default=32,
+        default=64,
         help="Tamanho do batch",
     )
 
@@ -159,7 +159,7 @@ def parse_args():
     parser.add_argument(
         "--amp_dtype",
         type=str,
-        default="bfloat16",
+        default="float16",
         help="Precisão usada pelo autocast (float32, float16 ou bfloat16)",
     )
 
@@ -213,13 +213,13 @@ def parse_args():
     parser.add_argument(
         "--warmup_iters",
         type=int,
-        default=5_000,
+        default=1_500,
         help="Período aonde o warmup está ativado",
     )
     parser.add_argument(
         "--cosine_cycle_iters",
         type=int,
-        default=100_000,
+        default=61_035,
         help="Período aonde o cosine cycle está ativado",
     )
     parser.add_argument(
@@ -260,7 +260,7 @@ def parse_args():
     parser.add_argument(
         "--val_interval",
         type=int,
-        default=50,
+        default=500,
         help="Intervalo de steps para se realizar uma avaliação",
     )
 
@@ -288,7 +288,7 @@ def parse_args():
     parser.add_argument(
         "--start_step_save_best_model",
         type=int,
-        default=50_000,
+        default=5000,
         help="Dita a partir de qual step o melhor modelo vai ser continuamente salvo. "
         "Quando o valor é < 0 o salvamento por melhor modelo é desativado",
     )
@@ -302,9 +302,7 @@ def parse_args():
 
     args = parser.parse_args()
 
-    if args.amp_dtype == "float32":
-        args.amp_dtype = torch.float32
-    elif args.amp_dtype == "float16":
+    if args.amp_dtype == "float16":
         args.amp_dtype = torch.float16
     elif args.amp_dtype == "bfloat16":
         args.amp_dtype = torch.bfloat16
@@ -326,12 +324,12 @@ def train():
     config = vars(args)
 
     if args.sample_interval > 0:
-        tokenizer = Tokenizer.from_pretrained("NousResearch/Llama-2-7b-hf")
+        tokenizer = Tokenizer.from_pretrained("nicholasKluge/TeenyTinyLlama-160m")
 
     amp_enabled = args.amp_dtype in (torch.float16, torch.bfloat16)
     use_grad_scaler = amp_enabled and args.amp_dtype == torch.float16
 
-    if args.device == "cuda" and args.dtype == torch.bfloat16:
+    if args.device == "cuda" and args.amp_dtype == torch.bfloat16:
         with torch.cuda.device(args.device):
             if not torch.cuda.is_bf16_supported():
                 raise RuntimeError("A GPU selecionada não suporta BF16")
@@ -350,7 +348,7 @@ def train():
 
         return torch.autocast(
             device_type=args.device,
-            dtype=args.dtype,
+            dtype=args.amp_dtype,
         )
 
     if args.wandb_log:
@@ -458,7 +456,7 @@ def train():
     logger.info(
         "ENV   | device=%s | amp_dtype=%s | compiled=%s",
         args.device,
-        str(args.dtype).removeprefix("torch."),
+        str(args.amp_dtype).removeprefix("torch."),
         args.torch_compile,
     )
     logger.info(
@@ -699,17 +697,15 @@ def train():
             # -----------------------------------------------------------
             # etapa de geração de samples
 
-            if last_step or (
-                args.sample_interval > 0 and step % args.sample_interval == 0
+            if args.sample_interval > 0 and (
+                last_step or (step + 1) % args.sample_interval == 0
             ):
                 model.eval()
 
                 prompts = [
                     "O homem é",
-                    "A minha coisa favorita é",
+                    "A capital do Brasil é",
                     "Era uma vez",
-                    "A capital da França é",
-                    "Alice pegou uma caixa azul. João pegou uma bola vermelha. Alice está com uma",
                 ]
 
                 sample_outputs = []
@@ -718,11 +714,11 @@ def train():
                     with torch.inference_mode(), autocast_context():
                         generated_tokens = generate(
                             model=model,
-                            max_new_tokens=1,
-                            eos_id=0,
+                            max_new_tokens=5,
+                            eos_id=tokenizer.token_to_id("</s>"),
                             prompt_tokens=tokenizer.encode(prompt).ids,
                             device=args.device,
-                            temperature=0.0,
+                            temperature=0.7,
                         )
 
                     response = tokenizer.decode(generated_tokens.tolist())
